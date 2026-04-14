@@ -16,19 +16,28 @@ const char TIME_API_CURRENT_IP_PATH[] = "/api/v1/time/current/ip";
 
 const char IP_API_HOST[] = "ip-api.com";
 const int IP_API_PORT = 80;
-const char IP_API_PATH[] = "/json/?fields=status,message,zip,lat,lon,offset";
+const char IP_API_PATH[] = "/json/?fields=status,message,zip,city,country,lat,lon,offset";
 
 const char WEATHER_API_HOST[] = "api.weatherapi.com";
 const int WEATHER_API_PORT = 443;
 const int WEATHER_API_HTTP_PORT = 80;
 const char WEATHER_API_KEY[] = "442cbb78d4644d56ae133317262302";
 
-const char FREE_ASTROLOGY_HOST[] = "json.freeastrologyapi.com";
-const int FREE_ASTROLOGY_PORT = 443;
-const char FREE_ASTROLOGY_API_KEY[] = "r9DOBHaobf9x1HHi01cooaZkENtqnI7O9tmx1LIy";
-const char FREE_ASTROLOGY_PATH[] = "/tithi-durations";
+const char PANCHANG_HOST[] = "daily-panchang-api.p.rapidapi.com";
+const int PANCHANG_PORT = 443;
+const char PANCHANG_PATH[] = "/indian-api/v1/find-panchang";
+const char PANCHANG_RAPIDAPI_HOST[] = "daily-panchang-api.p.rapidapi.com";
+const char PANCHANG_RAPIDAPI_KEY[] = "417c057219msh8122c86f3277805p19bb9ajsnee331aaed79e";
 
 int status = WL_IDLE_STATUS;
+
+void logOk(const String& scope, const String& details) {
+  Serial.println("OK " + scope + " " + details);
+}
+
+void logFail(const String& scope, int statusCode) {
+  Serial.println("FAIL " + scope + " status=" + String(statusCode));
+}
 
 String extractHttpBody(const String& response) {
   int bodyStart = response.indexOf("\r\n\r\n");
@@ -53,6 +62,8 @@ int extractHttpStatus(const String& response) {
 
 struct GeoData {
   String zip;
+  String city;
+  String country;
   float timezoneOffset;
   float lat;
   float lon;
@@ -122,34 +133,80 @@ unsigned long parseTimeToSeconds(const String& timeStr) {
   return (unsigned long)hours * 3600 + (unsigned long)minutes * 60 + (unsigned long)seconds;
 }
 
+bool isLeapYear(int year) {
+  if (year % 400 == 0) return true;
+  if (year % 100 == 0) return false;
+  return (year % 4 == 0);
+}
+
+int daysInMonth(int year, int month) {
+  if (month < 1 || month > 12) return 31;
+
+  static const int monthDays[12] = {
+    31, 28, 31, 30, 31, 30,
+    31, 31, 30, 31, 30, 31
+  };
+
+  if (month == 2 && isLeapYear(year)) {
+    return 29;
+  }
+
+  return monthDays[month - 1];
+}
+
 // Helper: Update local time based on elapsed ms since fetch
-// TODO: FIX THIS TO HANDLE ALL EDGE CASES!
 void updateLocalTimeFromCache() {
   unsigned long secondsElapsed = secondsElapsedSince(timeFetchedAtMs);
-  
-  // Calculate new time
-  unsigned long totalSeconds = parseTimeToSeconds(
-    String(cachedTimeData.hour) + ":" + String(cachedTimeData.minute) + ":" + String(cachedTimeData.second)
-  );
-  totalSeconds += secondsElapsed;
-  
-  // Handle day overflow
-  if (totalSeconds >= 86400) {
-    totalSeconds -= 86400;
-    cachedTimeData.day++;
-    if (cachedTimeData.day > 31) {  // Simplified; doesn't account for month length
-      cachedTimeData.day = 1;
-      cachedTimeData.month++;
-      if (cachedTimeData.month > 12) {
-        cachedTimeData.month = 1;
-        cachedTimeData.year++;
+
+  if (secondsElapsed == ULONG_MAX) {
+    return;
+  }
+
+  unsigned long long baseSeconds =
+    (unsigned long long)(cachedTimeData.hour * 3600) +
+    (unsigned long long)(cachedTimeData.minute * 60) +
+    (unsigned long long)cachedTimeData.second;
+
+  unsigned long long totalSeconds = baseSeconds + (unsigned long long)secondsElapsed;
+  unsigned long long daysToAdvance = totalSeconds / 86400ULL;
+  unsigned long secondsOfDay = (unsigned long)(totalSeconds % 86400ULL);
+
+  cachedTimeData.hour = (int)(secondsOfDay / 3600UL);
+  cachedTimeData.minute = (int)((secondsOfDay % 3600UL) / 60UL);
+  cachedTimeData.second = (int)(secondsOfDay % 60UL);
+
+  int year = cachedTimeData.year;
+  int month = cachedTimeData.month;
+  int day = cachedTimeData.day;
+
+  if (year < 1) year = 1970;
+  if (month < 1) month = 1;
+  if (month > 12) month = 12;
+  int maxDay = daysInMonth(year, month);
+  if (day < 1) day = 1;
+  if (day > maxDay) day = maxDay;
+
+  while (daysToAdvance > 0) {
+    maxDay = daysInMonth(year, month);
+    int remainingInMonth = maxDay - day;
+
+    if (daysToAdvance <= (unsigned long long)remainingInMonth) {
+      day += (int)daysToAdvance;
+      daysToAdvance = 0;
+    } else {
+      daysToAdvance -= (unsigned long long)(remainingInMonth + 1);
+      day = 1;
+      month++;
+      if (month > 12) {
+        month = 1;
+        year++;
       }
     }
   }
-  
-  cachedTimeData.hour = totalSeconds / 3600;
-  cachedTimeData.minute = (totalSeconds % 3600) / 60;
-  cachedTimeData.second = totalSeconds % 60;
+
+  cachedTimeData.year = year;
+  cachedTimeData.month = month;
+  cachedTimeData.day = day;
 }
 
 // Helper: Parse datetime string "YYYY-MM-DD HH:MM:SS" to milliseconds from now
@@ -197,12 +254,12 @@ bool httpGet(const char* host, int port, const String& path, bool useHttps, Stri
   WiFiSSLClient httpsClient;
   WiFiClient httpClient;
   WiFiClient* client = useHttps ? (WiFiClient*)&httpsClient : &httpClient;
+
+  client->setSocketTimeout(HTTP_TIMEOUT_MS);
+  client->setTimeout(HTTP_TIMEOUT_MS);
   
   if (!client->connect(host, port)) {
-    Serial.print("Failed to connect to ");
-    Serial.print(host);
-    Serial.print(":");
-    Serial.println(port);
+    statusCode = 0;
     return false;
   }
 
@@ -237,18 +294,20 @@ bool httpPostJson(
   const String& jsonBody,
   const char* apiKeyHeaderName,
   const char* apiKeyValue,
+  const char* extraHeaderName,
+  const char* extraHeaderValue,
   String& response,
   int& statusCode
 ) {
   WiFiSSLClient httpsClient;
   WiFiClient httpClient;
   WiFiClient* client = useHttps ? (WiFiClient*)&httpsClient : &httpClient;
+
+  client->setSocketTimeout(HTTP_TIMEOUT_MS);
+  client->setTimeout(HTTP_TIMEOUT_MS);
   
   if (!client->connect(host, port)) {
-    Serial.print("Failed to connect to ");
-    Serial.print(host);
-    Serial.print(":");
-    Serial.println(port);
+    statusCode = 0;
     return false;
   }
 
@@ -264,6 +323,13 @@ bool httpPostJson(
     request += apiKeyHeaderName;
     request += ": ";
     request += apiKeyValue;
+    request += "\r\n";
+  }
+
+  if (extraHeaderName != nullptr && extraHeaderValue != nullptr) {
+    request += extraHeaderName;
+    request += ": ";
+    request += extraHeaderValue;
     request += "\r\n";
   }
   
@@ -291,8 +357,6 @@ bool fetchPublicIp(String& ip) {
   int statusCode = 0;
   bool ok = httpGet(IPIFY_HOST, IPIFY_PORT, IPIFY_PATH, true, response, statusCode);
   if (!ok) {
-    Serial.print("ipify request failed. HTTP ");
-    Serial.println(statusCode);
     return false;
   }
 
@@ -300,16 +364,17 @@ bool fetchPublicIp(String& ip) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, jsonBody);
   if (err) {
-    Serial.print("ipify JSON parse failed: ");
-    Serial.println(err.c_str());
+    logFail("ipify", -2);
     return false;
   }
 
   ip = String(doc["ip"] | "");
   if (ip.length() == 0) {
-    Serial.println("ipify response missing ip field.");
+    logFail("ipify", -2);
     return false;
   }
+
+  logOk("ipify", "ip=" + ip);
 
   return true;
 }
@@ -321,17 +386,6 @@ bool fetchTimeFromTimeApi(const String& ipAddress, TimeData& timeData) {
 
   bool ok = httpGet(TIME_API_HOST, TIME_API_PORT, path, true, response, statusCode);
   if (!ok) {
-    Serial.print("timeapi.io request failed. HTTP ");
-    Serial.println(statusCode);
-    String errorBody = extractHttpBody(response);
-    Serial.print("timeapi.io request path: ");
-    Serial.println(path);
-    Serial.print("timeapi.io error body: ");
-    if (errorBody.length() == 0) {
-      Serial.println("<empty>");
-    } else {
-      Serial.println(errorBody);
-    }
     return false;
   }
 
@@ -339,14 +393,7 @@ bool fetchTimeFromTimeApi(const String& ipAddress, TimeData& timeData) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, jsonBody);
   if (err) {
-    Serial.print("timeapi.io JSON parse failed: ");
-    Serial.println(err.c_str());
-    Serial.print("timeapi.io raw body: ");
-    if (jsonBody.length() == 0) {
-      Serial.println("<empty>");
-    } else {
-      Serial.println(jsonBody);
-    }
+    logFail("timeapi", -2);
     return false;
   }
 
@@ -389,14 +436,16 @@ bool fetchTimeFromTimeApi(const String& ipAddress, TimeData& timeData) {
   }
 
   if (timeData.localTime.length() == 0 && timeData.iso.length() == 0) {
-    Serial.println("timeapi.io response did not include expected time fields.");
+    logFail("timeapi", -2);
     return false;
   }
 
   if (timeData.year == 0 || timeData.month == 0 || timeData.day == 0) {
-    Serial.println("timeapi.io response missing date components for astrology payload.");
+    logFail("timeapi", -2);
     return false;
   }
+
+  logOk("timeapi", "dt=" + String(timeData.year) + "-" + String(timeData.month) + "-" + String(timeData.day) + " " + timeData.localTime);
 
   return true;
 }
@@ -407,8 +456,7 @@ bool fetchGeoFromIpApi(GeoData& geo) {
 
   bool ok = httpGet(IP_API_HOST, IP_API_PORT, IP_API_PATH, false, response, statusCode);
   if (!ok) {
-    Serial.print("ip-api request failed. HTTP ");
-    Serial.println(statusCode);
+    logFail("ip-api", statusCode);
     return false;
   }
 
@@ -416,19 +464,19 @@ bool fetchGeoFromIpApi(GeoData& geo) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, jsonBody);
   if (err) {
-    Serial.print("ip-api JSON parse failed: ");
-    Serial.println(err.c_str());
+    logFail("ip-api", -2);
     return false;
   }
 
   String status = String(doc["status"] | "fail");
   if (status != "success") {
-    Serial.print("ip-api status error: ");
-    Serial.println(String(doc["message"] | "unknown"));
+    logFail("ip-api", statusCode);
     return false;
   }
 
   geo.zip = String(doc["zip"] | "");
+  geo.city = String(doc["city"] | "");
+  geo.country = String(doc["country"] | "");
   geo.lat = doc["lat"] | 0.0;
   geo.lon = doc["lon"] | 0.0;
 
@@ -436,9 +484,19 @@ bool fetchGeoFromIpApi(GeoData& geo) {
   geo.timezoneOffset = (float)offsetSeconds / 3600.0f;
 
   if (geo.lat < -90.0 || geo.lat > 90.0 || geo.lon < -180.0 || geo.lon > 180.0) {
-    Serial.println("ip-api returned invalid coordinates.");
+    logFail("ip-api", -2);
     return false;
   }
+
+  String loc = geo.city;
+  if (geo.country.length() > 0) {
+    if (loc.length() > 0) loc += ",";
+    loc += geo.country;
+  }
+  if (loc.length() == 0) {
+    loc = geo.zip;
+  }
+  logOk("ip-api", "loc=" + loc + " lat=" + String(geo.lat, 4) + " lon=" + String(geo.lon, 4));
 
   return true;
 }
@@ -456,30 +514,16 @@ bool fetchSunTimesFromWeatherApi(const String& ipAddress, const String& dateIso,
   path += "&dt=";
   path += urlEncode(dateIso);
 
-  Serial.print("weatherapi q value: ");
-  Serial.println(qValue);
-
   bool ok = httpGet(WEATHER_API_HOST, WEATHER_API_PORT, path, true, response, statusCode);
 
   // Some networks/boards intermittently fail TLS handshakes to weatherapi.
   // Retry over plain HTTP as a connectivity fallback when status is 0.
   if (!ok && statusCode == 0) {
-    Serial.println("weatherapi HTTPS failed with status 0, retrying over HTTP...");
     ok = httpGet(WEATHER_API_HOST, WEATHER_API_HTTP_PORT, path, false, response, statusCode);
   }
 
   if (!ok) {
-    Serial.print("weatherapi request failed. HTTP ");
-    Serial.println(statusCode);
-    Serial.print("weatherapi request path: ");
-    Serial.println(path);
-    String errorBody = extractHttpBody(response);
-    Serial.print("weatherapi error body: ");
-    if (errorBody.length() == 0) {
-      Serial.println("<empty>");
-    } else {
-      Serial.println(errorBody);
-    }
+    logFail("weatherapi", statusCode);
     return false;
   }
 
@@ -487,14 +531,7 @@ bool fetchSunTimesFromWeatherApi(const String& ipAddress, const String& dateIso,
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, jsonBody);
   if (err) {
-    Serial.print("weatherapi JSON parse failed: ");
-    Serial.println(err.c_str());
-    Serial.print("weatherapi raw body: ");
-    if (jsonBody.length() == 0) {
-      Serial.println("<empty>");
-    } else {
-      Serial.println(jsonBody);
-    }
+    logFail("weatherapi", -2);
     return false;
   }
 
@@ -502,32 +539,34 @@ bool fetchSunTimesFromWeatherApi(const String& ipAddress, const String& dateIso,
   data.sunset = String(doc["astronomy"]["astro"]["sunset"] | "");
 
   if (data.sunrise.length() == 0 || data.sunset.length() == 0) {
-    Serial.println("weatherapi response missing sunrise/sunset.");
+    logFail("weatherapi", -2);
     return false;
   }
+
+  logOk("weatherapi", "sunrise=" + data.sunrise + " sunset=" + data.sunset);
 
   return true;
 }
 
-bool fetchJainTithiFromFreeAstrology(
-  const TimeData& timeData,
-  float latitude,
-  float longitude,
-  float timezoneOffset,
-  JainTithiData& data
-) {
+bool fetchJainTithiFromPanchang(const TimeData& timeData, const GeoData& geo, JainTithiData& data) {
+  String dateIso = String(timeData.year) + "-";
+  if (timeData.month < 10) dateIso += "0";
+  dateIso += String(timeData.month) + "-";
+  if (timeData.day < 10) dateIso += "0";
+  dateIso += String(timeData.day);
+
+  String location = geo.city;
+  if (geo.country.length() > 0) {
+    if (location.length() > 0) location += ", ";
+    location += geo.country;
+  }
+  if (location.length() == 0) location = geo.zip;
+  if (location.length() == 0) location = "New York";
+
   JsonDocument payloadDoc;
-  payloadDoc["year"] = timeData.year;
-  payloadDoc["month"] = timeData.month;
-  payloadDoc["date"] = timeData.day;
-  payloadDoc["hours"] = timeData.hour;
-  payloadDoc["minutes"] = timeData.minute;
-  payloadDoc["seconds"] = timeData.second;
-  payloadDoc["latitude"] = latitude;
-  payloadDoc["longitude"] = longitude;
-  payloadDoc["timezone"] = timezoneOffset;
-  payloadDoc["config"]["observation_point"] = "topocentric";
-  payloadDoc["config"]["ayanamsha"] = "lahiri";
+  payloadDoc["date"] = dateIso;
+  payloadDoc["location"] = location;
+  payloadDoc["api_key"] = PANCHANG_RAPIDAPI_KEY;
 
   String payload;
   serializeJson(payloadDoc, payload);
@@ -535,20 +574,21 @@ bool fetchJainTithiFromFreeAstrology(
   String response;
   int statusCode = 0;
   bool ok = httpPostJson(
-    FREE_ASTROLOGY_HOST,
-    FREE_ASTROLOGY_PORT,
-    FREE_ASTROLOGY_PATH,
+    PANCHANG_HOST,
+    PANCHANG_PORT,
+    PANCHANG_PATH,
     true,
     payload,
-    "x-api-key",
-    FREE_ASTROLOGY_API_KEY,
+    "x-rapidapi-key",
+    PANCHANG_RAPIDAPI_KEY,
+    "x-rapidapi-host",
+    PANCHANG_RAPIDAPI_HOST,
     response,
     statusCode
   );
 
   if (!ok) {
-    Serial.print("freeastrologyapi request failed. HTTP ");
-    Serial.println(statusCode);
+    logFail("panchang", statusCode);
     return false;
   }
 
@@ -556,21 +596,29 @@ bool fetchJainTithiFromFreeAstrology(
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, jsonBody);
   if (err) {
-    Serial.print("freeastrologyapi JSON parse failed: ");
-    Serial.println(err.c_str());
+    logFail("panchang", -2);
     return false;
   }
 
-  data.number = doc["number"] | -1;
-  data.name = String(doc["name"] | "");
-  data.paksha = String(doc["paksha"] | "");
-  data.completesAt = String(doc["completes_at"] | "");
-  data.leftPercentage = doc["left_precentage"] | doc["left_percentage"] | 0.0;
-
-  if (data.name.length() == 0 || data.number < 1) {
-    Serial.println("freeastrologyapi response missing tithi fields.");
+  int success = doc["success"] | 0;
+  if (success != 1) {
+    int apiStatus = doc["statusCode"] | -3;
+    logFail("panchang", apiStatus);
     return false;
   }
+
+  data.name = String(doc["data"]["tithi"] | "");
+  data.paksha = String(doc["data"]["nakshatra"] | "");
+  data.number = 1;
+  data.leftPercentage = 0.0;
+  data.completesAt = dateIso + " 23:59:59";
+
+  if (data.name.length() == 0) {
+    logFail("panchang", -2);
+    return false;
+  }
+
+  logOk("panchang", "date=" + dateIso + " loc=" + location + " tithi=" + data.name);
 
   return true;
 }
@@ -578,7 +626,7 @@ bool fetchJainTithiFromFreeAstrology(
 void connectWiFi() {
   // check for the WiFi module:
   if (WiFi.status() == WL_NO_MODULE) {
-    Serial.println("Communication with WiFi module failed!");
+    logFail("wifi", WL_NO_MODULE);
     // don't continue
     while (true);
   }
@@ -586,56 +634,17 @@ void connectWiFi() {
   // attempt to connect to WiFi network:
   unsigned long connectStart = millis();
   while (status != WL_CONNECTED) {
-    Serial.print("Attempting to connect to SSID: ");
-    Serial.println(ssid);
     // Connect to WPA/WPA2 network. Change this line if using open network:
     status = WiFi.begin(ssid);
 
     // wait 3 seconds for connection:
     delay(3000);
     if (millis() - connectStart >= WIFI_TIMEOUT_MS) {
-      Serial.println("WiFi connection timed out, retrying...");
+      logFail("wifi", status);
       connectStart = millis();
     }
   }
-  Serial.println("Connected to WiFi");
-}
-
-void printApiSnapshot(const GeoData& geo, const TimeData& timeData, const SunData& sun, const JainTithiData& tithi) {
-  Serial.println("----- Jain Clock Data Snapshot -----");
-  Serial.print("ZIP: ");
-  Serial.println(geo.zip);
-  Serial.print("Timezone offset: ");
-  Serial.println(geo.timezoneOffset, 2);
-  Serial.print("Lat/Lon: ");
-  Serial.print(geo.lat, 6);
-  Serial.print(", ");
-  Serial.println(geo.lon, 6);
-
-  Serial.print("Current time: ");
-  if (timeData.localTime.length()) {
-    Serial.println(timeData.localTime);
-  } else {
-    Serial.println(timeData.iso);
-  }
-
-  Serial.print("Sunrise: ");
-  Serial.println(sun.sunrise);
-  Serial.print("Sunset: ");
-  Serial.println(sun.sunset);
-
-  Serial.print("Jain tithi: ");
-  Serial.print(tithi.name);
-  Serial.print(" (#");
-  Serial.print(tithi.number);
-  Serial.println(")");
-  Serial.print("Paksha: ");
-  Serial.println(tithi.paksha);
-  Serial.print("Completes at: ");
-  Serial.println(tithi.completesAt);
-  Serial.print("Left (%): ");
-  Serial.println(tithi.leftPercentage, 2);
-  Serial.println("------------------------------------");
+  logOk("wifi", "ssid=" + String(ssid));
 }
 
 void setup() {
@@ -703,7 +712,7 @@ void loop() {
   }
   
   if (needsTithiRefresh) {
-    if (!fetchJainTithiFromFreeAstrology(cachedTimeData, cachedGeo.lat, cachedGeo.lon, cachedGeo.timezoneOffset, cachedTithi)) {
+    if (!fetchJainTithiFromPanchang(cachedTimeData, cachedGeo, cachedTithi)) {
       delay(30000);
       return;
     }
@@ -712,9 +721,6 @@ void loop() {
     // Calculate when this tithi expires
     tithiExpiresAtMs = millis() + parseCompleteTimeToFutureMs(cachedTithi.completesAt);
   }
-
-  // ========== DISPLAY CURRENT STATE ==========
-  printApiSnapshot(cachedGeo, cachedTimeData, cachedSun, cachedTithi);
 
   // ========== SMART SLEEP ==========
   // Calculate next wake-up time based on nearest refresh deadline
