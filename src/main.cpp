@@ -2,32 +2,16 @@
 #include <WiFiSSLClient.h>
 #include <ArduinoJson.h>
 
-char ssid[] = "NB_Guest";
+char ssid[] = "Arihant24g";
+char password[] = "7328299909";
+
 const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long HTTP_TIMEOUT_MS = 10000;
 
-const char IPIFY_HOST[] = "api.ipify.org";
-const int IPIFY_PORT = 443;
-const char IPIFY_PATH[] = "/?format=json";
-
-const char TIME_API_HOST[] = "timeapi.io";
-const int TIME_API_PORT = 443;
-const char TIME_API_CURRENT_IP_PATH[] = "/api/v1/time/current/ip";
-
-const char IP_API_HOST[] = "ip-api.com";
-const int IP_API_PORT = 80;
-const char IP_API_PATH[] = "/json/?fields=status,message,zip,city,country,lat,lon,offset";
-
-const char WEATHER_API_HOST[] = "api.weatherapi.com";
-const int WEATHER_API_PORT = 443;
-const int WEATHER_API_HTTP_PORT = 80;
-const char WEATHER_API_KEY[] = "442cbb78d4644d56ae133317262302";
-
-const char PANCHANG_HOST[] = "daily-panchang-api.p.rapidapi.com";
-const int PANCHANG_PORT = 443;
-const char PANCHANG_PATH[] = "/indian-api/v1/find-panchang";
-const char PANCHANG_RAPIDAPI_HOST[] = "daily-panchang-api.p.rapidapi.com";
-const char PANCHANG_RAPIDAPI_KEY[] = "417c057219msh8122c86f3277805p19bb9ajsnee331aaed79e";
+const char AGG_API_HOST[] = "jain-clock-server.vercel.app";
+const int AGG_API_PORT = 443;
+const char AGG_API_PATH[] = "/api/data";
+const bool AGG_API_USE_HTTPS = true;
 
 int status = WL_IDLE_STATUS;
 
@@ -100,14 +84,12 @@ const unsigned long SIX_HOURS_MS = 6 * 60 * 60 * 1000UL;
 const unsigned long ONE_MINUTE_MS = 60 * 1000UL;
 
 // Cached data (persists across loop iterations)
-String cachedPublicIp = "";
 GeoData cachedGeo;
 TimeData cachedTimeData;
 SunData cachedSun;
 JainTithiData cachedTithi;
 
 // Timestamps (millis() when each data was fetched)
-unsigned long ipFetchedAtMs = 0;
 unsigned long timeFetchedAtMs = 0;
 unsigned long tithiFetchedAtMs = 0;
 unsigned long tithiExpiresAtMs = 0;  // When the tithi duration ends (from completesAt)
@@ -233,23 +215,6 @@ unsigned long parseCompleteTimeToFutureMs(const String& dateTimeStr) {
   }
 }
 
-String urlEncode(const String& value) {
-  String encoded;
-  char hex[4];
-
-  for (size_t i = 0; i < value.length(); i++) {
-    char c = value.charAt(i);
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      encoded += c;
-    } else {
-      snprintf(hex, sizeof(hex), "%%%02X", static_cast<unsigned char>(c));
-      encoded += hex;
-    }
-  }
-
-  return encoded;
-}
-
 bool httpGet(const char* host, int port, const String& path, bool useHttps, String& response, int& statusCode) {
   WiFiSSLClient httpsClient;
   WiFiClient httpClient;
@@ -286,339 +251,92 @@ bool httpGet(const char* host, int port, const String& path, bool useHttps, Stri
   return statusCode >= 200 && statusCode < 300;
 }
 
-bool httpPostJson(
-  const char* host,
-  int port,
-  const String& path,
-  bool useHttps,
-  const String& jsonBody,
-  const char* apiKeyHeaderName,
-  const char* apiKeyValue,
-  const char* extraHeaderName,
-  const char* extraHeaderValue,
-  String& response,
-  int& statusCode
-) {
-  WiFiSSLClient httpsClient;
-  WiFiClient httpClient;
-  WiFiClient* client = useHttps ? (WiFiClient*)&httpsClient : &httpClient;
+// ========== UNIFIED FETCH FUNCTION ==========
+// Single call to aggregation API returns: geo, time, sun, tithi data in one response
+bool fetchAggregatedDataFromServer(TimeData& timeData, GeoData& geo, SunData& sun, JainTithiData& tithi) {
+  String response;
+  int statusCode = 0;
 
-  client->setSocketTimeout(HTTP_TIMEOUT_MS);
-  client->setTimeout(HTTP_TIMEOUT_MS);
+  bool ok = httpGet(AGG_API_HOST, AGG_API_PORT, AGG_API_PATH, AGG_API_USE_HTTPS, response, statusCode);
   
-  if (!client->connect(host, port)) {
-    statusCode = 0;
+  // Retry once on transport failure (status=0)
+  if (!ok && statusCode == 0) {
+    delay(300);
+    ok = httpGet(AGG_API_HOST, AGG_API_PORT, AGG_API_PATH, AGG_API_USE_HTTPS, response, statusCode);
+  }
+
+  if (!ok) {
+    logFail("aggapi", statusCode);
     return false;
   }
 
-  String request = "POST ";
-  request += path;
-  request += " HTTP/1.1\r\nHost: ";
-  request += host;
-  request += "\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: ";
-  request += jsonBody.length();
-  request += "\r\n";
-  
-  if (apiKeyHeaderName != nullptr && apiKeyValue != nullptr) {
-    request += apiKeyHeaderName;
-    request += ": ";
-    request += apiKeyValue;
-    request += "\r\n";
+  String jsonBody = extractHttpBody(response);
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, jsonBody);
+  if (err) {
+    logFail("aggapi", -2);
+    return false;
   }
 
-  if (extraHeaderName != nullptr && extraHeaderValue != nullptr) {
-    request += extraHeaderName;
-    request += ": ";
-    request += extraHeaderValue;
-    request += "\r\n";
+  // Parse GEO data
+  JsonObject geoObj = doc["geo"].as<JsonObject>();
+  if (!geoObj.isNull()) {
+    geo.zip = String(geoObj["zip"] | "");
+    geo.city = String(geoObj["city"] | "");
+    geo.country = String(geoObj["country"] | "");
+    geo.lat = geoObj["lat"] | 0.0;
+    geo.lon = geoObj["lon"] | 0.0;
+    geo.timezoneOffset = geoObj["timezoneOffset"] | 0.0;
   }
-  
-  request += "Connection: close\r\n\r\n";
-  request += jsonBody;
-  
-  client->print(request);
-  
-  response = "";
-  unsigned long timeout = millis() + HTTP_TIMEOUT_MS;
-  while (client->connected() && millis() < timeout) {
-    if (client->available()) {
-      response += (char)client->read();
+
+  // Parse TIME data
+  JsonObject timeObj = doc["time"].as<JsonObject>();
+  if (!timeObj.isNull()) {
+    String dateStr = String(timeObj["date"] | "");
+    String timeStr = String(timeObj["time"] | "");
+    timeData.iso = String(timeObj["iso"] | "");
+    timeData.localTime = timeStr;
+
+    // Parse date: YYYY-MM-DD
+    if (dateStr.length() >= 10) {
+      timeData.year = atoi(dateStr.substring(0, 4).c_str());
+      timeData.month = atoi(dateStr.substring(5, 7).c_str());
+      timeData.day = atoi(dateStr.substring(8, 10).c_str());
+    }
+
+    // Parse time: HH:MM:SS
+    if (timeStr.length() >= 8) {
+      timeData.hour = atoi(timeStr.substring(0, 2).c_str());
+      timeData.minute = atoi(timeStr.substring(3, 5).c_str());
+      timeData.second = atoi(timeStr.substring(6, 8).c_str());
     }
   }
-  
-  client->stop();
-  
-  statusCode = extractHttpStatus(response);
-  return statusCode >= 200 && statusCode < 300;
-}
 
-bool fetchPublicIp(String& ip) {
-  String response;
-  int statusCode = 0;
-  bool ok = httpGet(IPIFY_HOST, IPIFY_PORT, IPIFY_PATH, true, response, statusCode);
-  if (!ok) {
+  // Parse SUN data
+  JsonObject sunObj = doc["sun"].as<JsonObject>();
+  if (!sunObj.isNull()) {
+    sun.sunrise = String(sunObj["sunrise"] | "");
+    sun.sunset = String(sunObj["sunset"] | "");
+  }
+
+  // Parse TITHI data
+  JsonObject tithiObj = doc["tithi"].as<JsonObject>();
+  if (!tithiObj.isNull()) {
+    tithi.number = tithiObj["number"] | -1;
+    tithi.name = String(tithiObj["name"] | "");
+    tithi.paksha = String(tithiObj["paksha"] | "");
+    tithi.completesAt = String(tithiObj["completesAt"] | "");
+    tithi.leftPercentage = tithiObj["leftPercentage"] | 0.0;
+  }
+
+  // Validation: Ensure we got the essential data
+  if (timeData.year < 1 || geo.lat < -90.0 || geo.lat > 90.0 || 
+      tithi.number < 1 || tithi.name.length() == 0) {
+    logFail("aggapi", -2);
     return false;
   }
 
-  String jsonBody = extractHttpBody(response);
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, jsonBody);
-  if (err) {
-    logFail("ipify", -2);
-    return false;
-  }
-
-  ip = String(doc["ip"] | "");
-  if (ip.length() == 0) {
-    logFail("ipify", -2);
-    return false;
-  }
-
-  logOk("ipify", "ip=" + ip);
-
-  return true;
-}
-
-bool fetchTimeFromTimeApi(const String& ipAddress, TimeData& timeData) {
-  String response;
-  int statusCode = 0;
-  String path = String(TIME_API_CURRENT_IP_PATH) + "?ipAddress=" + urlEncode(ipAddress);
-
-  bool ok = httpGet(TIME_API_HOST, TIME_API_PORT, path, true, response, statusCode);
-  if (!ok) {
-    return false;
-  }
-
-  String jsonBody = extractHttpBody(response);
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, jsonBody);
-  if (err) {
-    logFail("timeapi", -2);
-    return false;
-  }
-
-  String dateStr = String(doc["date"] | "");
-  String timeStr = String(doc["time"] | "");
-
-  timeData.localTime = timeStr;
-  if (dateStr.length() > 0 && timeStr.length() > 0) {
-    timeData.iso = dateStr + " " + timeStr;
-  } else {
-    timeData.iso = "";
-  }
-
-  // Parse date: YYYY-MM-DD
-  if (dateStr.length() >= 10 && dateStr.charAt(4) == '-' && dateStr.charAt(7) == '-') {
-    timeData.year = atoi(dateStr.substring(0, 4).c_str());
-    timeData.month = atoi(dateStr.substring(5, 7).c_str());
-    timeData.day = atoi(dateStr.substring(8, 10).c_str());
-  } else {
-    timeData.year = 0;
-    timeData.month = 0;
-    timeData.day = 0;
-  }
-
-  // Parse time: HH:MM:SS (ignore anything after seconds)
-  if (timeStr.length() >= 8 && timeStr.charAt(2) == ':' && timeStr.charAt(5) == ':') {
-    timeData.hour = atoi(timeStr.substring(0, 2).c_str());
-    timeData.minute = atoi(timeStr.substring(3, 5).c_str());
-    timeData.second = atoi(timeStr.substring(6, 8).c_str());
-  } else {
-    timeData.hour = 0;
-    timeData.minute = 0;
-    timeData.second = 0;
-  }
-
-  if (timeData.localTime.length() == 0 && timeData.hour >= 0) {
-    char buff[9];
-    snprintf(buff, sizeof(buff), "%02d:%02d:%02d", timeData.hour, timeData.minute, timeData.second);
-    timeData.localTime = String(buff);
-  }
-
-  if (timeData.localTime.length() == 0 && timeData.iso.length() == 0) {
-    logFail("timeapi", -2);
-    return false;
-  }
-
-  if (timeData.year == 0 || timeData.month == 0 || timeData.day == 0) {
-    logFail("timeapi", -2);
-    return false;
-  }
-
-  logOk("timeapi", "dt=" + String(timeData.year) + "-" + String(timeData.month) + "-" + String(timeData.day) + " " + timeData.localTime);
-
-  return true;
-}
-
-bool fetchGeoFromIpApi(GeoData& geo) {
-  String response;
-  int statusCode = 0;
-
-  bool ok = httpGet(IP_API_HOST, IP_API_PORT, IP_API_PATH, false, response, statusCode);
-  if (!ok) {
-    logFail("ip-api", statusCode);
-    return false;
-  }
-
-  String jsonBody = extractHttpBody(response);
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, jsonBody);
-  if (err) {
-    logFail("ip-api", -2);
-    return false;
-  }
-
-  String status = String(doc["status"] | "fail");
-  if (status != "success") {
-    logFail("ip-api", statusCode);
-    return false;
-  }
-
-  geo.zip = String(doc["zip"] | "");
-  geo.city = String(doc["city"] | "");
-  geo.country = String(doc["country"] | "");
-  geo.lat = doc["lat"] | 0.0;
-  geo.lon = doc["lon"] | 0.0;
-
-  int offsetSeconds = doc["offset"] | 0;
-  geo.timezoneOffset = (float)offsetSeconds / 3600.0f;
-
-  if (geo.lat < -90.0 || geo.lat > 90.0 || geo.lon < -180.0 || geo.lon > 180.0) {
-    logFail("ip-api", -2);
-    return false;
-  }
-
-  String loc = geo.city;
-  if (geo.country.length() > 0) {
-    if (loc.length() > 0) loc += ",";
-    loc += geo.country;
-  }
-  if (loc.length() == 0) {
-    loc = geo.zip;
-  }
-  logOk("ip-api", "loc=" + loc + " lat=" + String(geo.lat, 4) + " lon=" + String(geo.lon, 4));
-
-  return true;
-}
-
-bool fetchSunTimesFromWeatherApi(const String& ipAddress, const String& dateIso, SunData& data) {
-  String response;
-  int statusCode = 0;
-
-  String qValue = ipAddress.length() > 0 ? ipAddress : "auto:ip";
-
-  String path = "/v1/astronomy.json?key=";
-  path += WEATHER_API_KEY;
-  path += "&q=";
-  path += urlEncode(qValue);
-  path += "&dt=";
-  path += urlEncode(dateIso);
-
-  bool ok = httpGet(WEATHER_API_HOST, WEATHER_API_PORT, path, true, response, statusCode);
-
-  // Some networks/boards intermittently fail TLS handshakes to weatherapi.
-  // Retry over plain HTTP as a connectivity fallback when status is 0.
-  if (!ok && statusCode == 0) {
-    ok = httpGet(WEATHER_API_HOST, WEATHER_API_HTTP_PORT, path, false, response, statusCode);
-  }
-
-  if (!ok) {
-    logFail("weatherapi", statusCode);
-    return false;
-  }
-
-  String jsonBody = extractHttpBody(response);
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, jsonBody);
-  if (err) {
-    logFail("weatherapi", -2);
-    return false;
-  }
-
-  data.sunrise = String(doc["astronomy"]["astro"]["sunrise"] | "");
-  data.sunset = String(doc["astronomy"]["astro"]["sunset"] | "");
-
-  if (data.sunrise.length() == 0 || data.sunset.length() == 0) {
-    logFail("weatherapi", -2);
-    return false;
-  }
-
-  logOk("weatherapi", "sunrise=" + data.sunrise + " sunset=" + data.sunset);
-
-  return true;
-}
-
-bool fetchJainTithiFromPanchang(const TimeData& timeData, const GeoData& geo, JainTithiData& data) {
-  String dateIso = String(timeData.year) + "-";
-  if (timeData.month < 10) dateIso += "0";
-  dateIso += String(timeData.month) + "-";
-  if (timeData.day < 10) dateIso += "0";
-  dateIso += String(timeData.day);
-
-  String location = geo.city;
-  if (geo.country.length() > 0) {
-    if (location.length() > 0) location += ", ";
-    location += geo.country;
-  }
-  if (location.length() == 0) location = geo.zip;
-  if (location.length() == 0) location = "New York";
-
-  JsonDocument payloadDoc;
-  payloadDoc["date"] = dateIso;
-  payloadDoc["location"] = location;
-  payloadDoc["api_key"] = PANCHANG_RAPIDAPI_KEY;
-
-  String payload;
-  serializeJson(payloadDoc, payload);
-
-  String response;
-  int statusCode = 0;
-  bool ok = httpPostJson(
-    PANCHANG_HOST,
-    PANCHANG_PORT,
-    PANCHANG_PATH,
-    true,
-    payload,
-    "x-rapidapi-key",
-    PANCHANG_RAPIDAPI_KEY,
-    "x-rapidapi-host",
-    PANCHANG_RAPIDAPI_HOST,
-    response,
-    statusCode
-  );
-
-  if (!ok) {
-    logFail("panchang", statusCode);
-    return false;
-  }
-
-  String jsonBody = extractHttpBody(response);
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, jsonBody);
-  if (err) {
-    logFail("panchang", -2);
-    return false;
-  }
-
-  int success = doc["success"] | 0;
-  if (success != 1) {
-    int apiStatus = doc["statusCode"] | -3;
-    logFail("panchang", apiStatus);
-    return false;
-  }
-
-  data.name = String(doc["data"]["tithi"] | "");
-  data.paksha = String(doc["data"]["nakshatra"] | "");
-  data.number = 1;
-  data.leftPercentage = 0.0;
-  data.completesAt = dateIso + " 23:59:59";
-
-  if (data.name.length() == 0) {
-    logFail("panchang", -2);
-    return false;
-  }
-
-  logOk("panchang", "date=" + dateIso + " loc=" + location + " tithi=" + data.name);
+  logOk("aggapi", "all_data_fetched");
 
   return true;
 }
@@ -634,8 +352,11 @@ void connectWiFi() {
   // attempt to connect to WiFi network:
   unsigned long connectStart = millis();
   while (status != WL_CONNECTED) {
-    // Connect to WPA/WPA2 network. Change this line if using open network:
-    status = WiFi.begin(ssid);
+    if (password == nullptr || strlen(password) == 0) {
+      status = WiFi.begin(ssid);
+    } else {
+      status = WiFi.begin(ssid, password);
+    }
 
     // wait 3 seconds for connection:
     delay(3000);
@@ -655,81 +376,36 @@ void setup() {
 }
 
 void loop() {
-  // ========== FETCH IP (once, at startup) ==========
-  if (ipFetchedAtMs == 0) {
-    if (!fetchPublicIp(cachedPublicIp)) {
-      delay(30000);
-      return;
-    }
-    ipFetchedAtMs = millis();
-  }
-
-  // ========== FETCH TIME & GEO (first boot + every 6 hours) ==========
-  bool needsTimeRefresh = (timeFetchedAtMs == 0) || (secondsElapsedSince(timeFetchedAtMs) >= SIX_HOURS_MS / 1000);
+  // ========== FETCH ALL DATA (first boot + every 6 hours) ==========
+  // Unlike the old approach (4 separate calls), this single call gets: geo, time, weather, tithi
+  bool needsDataRefresh = (timeFetchedAtMs == 0) || (secondsElapsedSince(timeFetchedAtMs) >= SIX_HOURS_MS / 1000);
   
-  if (needsTimeRefresh) {
-    if (!fetchTimeFromTimeApi(cachedPublicIp, cachedTimeData)) {
-      delay(30000);
-      return;
-    }
-
-    if (!fetchGeoFromIpApi(cachedGeo)) {
+  if (needsDataRefresh) {
+    if (!fetchAggregatedDataFromServer(cachedTimeData, cachedGeo, cachedSun, cachedTithi)) {
       delay(30000);
       return;
     }
 
     timeFetchedAtMs = millis();
-    
-    // Generate date string for weather API
-    String dateIso = String(cachedTimeData.year) + "-";
-    if (cachedTimeData.month < 10) dateIso += "0";
-    dateIso += String(cachedTimeData.month) + "-";
-    if (cachedTimeData.day < 10) dateIso += "0";
-    dateIso += String(cachedTimeData.day);
-    
-    // ========== FETCH WEATHER (with time refresh + every 6 hours) ==========
-    if (!fetchSunTimesFromWeatherApi(cachedPublicIp, dateIso, cachedSun)) {
-      delay(30000);
-      return;
-    }
-  } else {
-    // Update local time based on elapsed milliseconds since fetch
-    updateLocalTimeFromCache();
-  }
-
-  // ========== FETCH TITHI (first boot + 1 minute after expiry) ==========
-  bool needsTithiRefresh = false;
-  
-  if (tithiFetchedAtMs == 0) {
-    // First fetch
-    needsTithiRefresh = true;
-  } else if (tithiExpiresAtMs > 0 && millis() >= tithiExpiresAtMs) {
-    // Tithi has expired, wait 1 minute then refresh
-    unsigned long timeSinceExpiry = millis() - tithiExpiresAtMs;
-    if (timeSinceExpiry >= ONE_MINUTE_MS) {
-      needsTithiRefresh = true;
-    }
-  }
-  
-  if (needsTithiRefresh) {
-    if (!fetchJainTithiFromPanchang(cachedTimeData, cachedGeo, cachedTithi)) {
-      delay(30000);
-      return;
-    }
     tithiFetchedAtMs = millis();
     
     // Calculate when this tithi expires
     tithiExpiresAtMs = millis() + parseCompleteTimeToFutureMs(cachedTithi.completesAt);
+    
+    logOk("schedule", "data_refreshed");
+  } else {
+    // Update local time based on elapsed milliseconds since fetch
+    updateLocalTimeFromCache();
   }
 
   // ========== SMART SLEEP ==========
   // Calculate next wake-up time based on nearest refresh deadline
   unsigned long nextWakeUpMs = ULONG_MAX;
   
-  // Time/weather refresh in 6 hours
+  // Data refresh in 6 hours
   if (timeFetchedAtMs > 0) {
-    unsigned long nextTimeRefresh = timeFetchedAtMs + SIX_HOURS_MS;
-    if (nextTimeRefresh < nextWakeUpMs) nextWakeUpMs = nextTimeRefresh;
+    unsigned long nextDataRefresh = timeFetchedAtMs + SIX_HOURS_MS;
+    if (nextDataRefresh < nextWakeUpMs) nextWakeUpMs = nextDataRefresh;
   }
   
   // Tithi refresh (expiry + 1 minute)
