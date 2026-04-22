@@ -2,8 +2,8 @@
 #include <WiFiSSLClient.h>
 #include <ArduinoJson.h>
 
-char ssid[] = "Arihant24g";
-char password[] = "7328299909";
+char ssid[] = "NB_Guest";
+char password[] = "";
 
 const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long HTTP_TIMEOUT_MS = 10000;
@@ -77,6 +77,33 @@ struct JainTithiData {
   float leftPercentage;
 };
 
+void printFetchedData(const String& ip, const GeoData& geo, const TimeData& timeData, const SunData& sun, const JainTithiData& tithi) {
+  Serial.println("----- Fetched Data -----");
+  Serial.println("ip: " + ip);
+  Serial.println("geo.status: success");
+  Serial.println("geo.country: " + geo.country);
+  Serial.println("geo.city: " + geo.city);
+  Serial.println("geo.zip: " + geo.zip);
+  Serial.println("geo.lat: " + String(geo.lat, 6));
+  Serial.println("geo.lon: " + String(geo.lon, 6));
+  Serial.println("geo.offset_hours: " + String(geo.timezoneOffset, 2));
+  Serial.println("time.year: " + String(timeData.year));
+  Serial.println("time.month: " + String(timeData.month));
+  Serial.println("time.day: " + String(timeData.day));
+  Serial.println("time.hour: " + String(timeData.hour));
+  Serial.println("time.minute: " + String(timeData.minute));
+  Serial.println("time.second: " + String(timeData.second));
+  Serial.println("time.iso: " + timeData.iso);
+  Serial.println("sun.sunrise: " + sun.sunrise);
+  Serial.println("sun.sunset: " + sun.sunset);
+  Serial.println("tithi.number: " + String(tithi.number));
+  Serial.println("tithi.name: " + tithi.name);
+  Serial.println("tithi.paksha: " + tithi.paksha);
+  Serial.println("tithi.completesAt: " + tithi.completesAt);
+  Serial.println("tithi.leftPercentage: " + String(tithi.leftPercentage, 2));
+  Serial.println("------------------------");
+}
+
 // -------------------------
 // State tracking for smart refresh scheduling
 // -------------------------
@@ -90,9 +117,8 @@ SunData cachedSun;
 JainTithiData cachedTithi;
 
 // Timestamps (millis() when each data was fetched)
-unsigned long timeFetchedAtMs = 0;
-unsigned long tithiFetchedAtMs = 0;
-unsigned long tithiExpiresAtMs = 0;  // When the tithi duration ends (from completesAt)
+unsigned long dataFetchedAtMs = 0;
+unsigned long tithiExpiresAtMs = 0;
 
 // Helper: Calculate seconds elapsed since a timestamp
 unsigned long secondsElapsedSince(unsigned long timestampMs) {
@@ -138,7 +164,7 @@ int daysInMonth(int year, int month) {
 
 // Helper: Update local time based on elapsed ms since fetch
 void updateLocalTimeFromCache() {
-  unsigned long secondsElapsed = secondsElapsedSince(timeFetchedAtMs);
+  unsigned long secondsElapsed = secondsElapsedSince(dataFetchedAtMs);
 
   if (secondsElapsed == ULONG_MAX) {
     return;
@@ -193,11 +219,6 @@ void updateLocalTimeFromCache() {
 
 // Helper: Parse datetime string "YYYY-MM-DD HH:MM:SS" to milliseconds from now
 unsigned long parseCompleteTimeToFutureMs(const String& dateTimeStr) {
-  // Expected format: "2026-03-25 14:30:45"
-  // Returns: milliseconds until that time (assuming same day or next day if already passed)
-  
-  // For simplicity, assume completesAt is today or tomorrow
-  // We'll calculate seconds until that time and convert to ms
   int spacePos = dateTimeStr.indexOf(' ');
   if (spacePos == -1) return 0;
   
@@ -251,9 +272,8 @@ bool httpGet(const char* host, int port, const String& path, bool useHttps, Stri
   return statusCode >= 200 && statusCode < 300;
 }
 
-// ========== UNIFIED FETCH FUNCTION ==========
 // Single call to aggregation API returns: geo, time, sun, tithi data in one response
-bool fetchAggregatedDataFromServer(TimeData& timeData, GeoData& geo, SunData& sun, JainTithiData& tithi) {
+bool fetchAggregatedDataFromServer(String& ip, TimeData& timeData, GeoData& geo, SunData& sun, JainTithiData& tithi) {
   String response;
   int statusCode = 0;
 
@@ -281,35 +301,37 @@ bool fetchAggregatedDataFromServer(TimeData& timeData, GeoData& geo, SunData& su
   // Parse GEO data
   JsonObject geoObj = doc["geo"].as<JsonObject>();
   if (!geoObj.isNull()) {
+    ip = String(doc["ip"] | "");
     geo.zip = String(geoObj["zip"] | "");
     geo.city = String(geoObj["city"] | "");
     geo.country = String(geoObj["country"] | "");
     geo.lat = geoObj["lat"] | 0.0;
     geo.lon = geoObj["lon"] | 0.0;
-    geo.timezoneOffset = geoObj["timezoneOffset"] | 0.0;
+    geo.timezoneOffset = geoObj["offset"] | 0.0;
   }
 
   // Parse TIME data
   JsonObject timeObj = doc["time"].as<JsonObject>();
   if (!timeObj.isNull()) {
-    String dateStr = String(timeObj["date"] | "");
-    String timeStr = String(timeObj["time"] | "");
-    timeData.iso = String(timeObj["iso"] | "");
-    timeData.localTime = timeStr;
+    // Read individual fields
+    timeData.year = timeObj["year"] | 0;
+    timeData.month = timeObj["month"] | 0;
+    timeData.day = timeObj["day"] | 0;
+    timeData.hour = timeObj["hour"] | 0;
+    timeData.minute = timeObj["minute"] | 0;
+    timeData.second = timeObj["seconds"] | 0;
 
-    // Parse date: YYYY-MM-DD
-    if (dateStr.length() >= 10) {
-      timeData.year = atoi(dateStr.substring(0, 4).c_str());
-      timeData.month = atoi(dateStr.substring(5, 7).c_str());
-      timeData.day = atoi(dateStr.substring(8, 10).c_str());
-    }
+    // Format time as HH:MM:SS for local display
+    char buff[9];
+    snprintf(buff, sizeof(buff), "%02d:%02d:%02d", timeData.hour, timeData.minute, timeData.second);
+    timeData.localTime = String(buff);
 
-    // Parse time: HH:MM:SS
-    if (timeStr.length() >= 8) {
-      timeData.hour = atoi(timeStr.substring(0, 2).c_str());
-      timeData.minute = atoi(timeStr.substring(3, 5).c_str());
-      timeData.second = atoi(timeStr.substring(6, 8).c_str());
-    }
+    // Format ISO datetime
+    char isoBuff[20];
+    snprintf(isoBuff, sizeof(isoBuff), "%04d-%02d-%02d %02d:%02d:%02d", 
+             timeData.year, timeData.month, timeData.day, 
+             timeData.hour, timeData.minute, timeData.second);
+    timeData.iso = String(isoBuff);
   }
 
   // Parse SUN data
@@ -319,14 +341,18 @@ bool fetchAggregatedDataFromServer(TimeData& timeData, GeoData& geo, SunData& su
     sun.sunset = String(sunObj["sunset"] | "");
   }
 
-  // Parse TITHI data
-  JsonObject tithiObj = doc["tithi"].as<JsonObject>();
-  if (!tithiObj.isNull()) {
-    tithi.number = tithiObj["number"] | -1;
-    tithi.name = String(tithiObj["name"] | "");
-    tithi.paksha = String(tithiObj["paksha"] | "");
-    tithi.completesAt = String(tithiObj["completesAt"] | "");
-    tithi.leftPercentage = tithiObj["leftPercentage"] | 0.0;
+  // Parse TITHI data (returned as JSON-stringified string, need to parse it again)
+  String tithiJsonStr = String(doc["tithi"] | "");
+  if (tithiJsonStr.length() > 0) {
+    JsonDocument tithiDoc;
+    DeserializationError tithiErr = deserializeJson(tithiDoc, tithiJsonStr);
+    if (!tithiErr) {
+      tithi.number = tithiDoc["number"] | -1;
+      tithi.name = String(tithiDoc["name"] | "");
+      tithi.paksha = String(tithiDoc["paksha"] | "");
+      tithi.completesAt = String(tithiDoc["completes_at"] | "");
+      tithi.leftPercentage = tithiDoc["left_precentage"] | 0.0;
+    }
   }
 
   // Validation: Ensure we got the essential data
@@ -336,11 +362,13 @@ bool fetchAggregatedDataFromServer(TimeData& timeData, GeoData& geo, SunData& su
     return false;
   }
 
+  printFetchedData(ip, geo, timeData, sun, tithi);
   logOk("aggapi", "all_data_fetched");
 
   return true;
 }
 
+// Connect to WiFi with retries and logging
 void connectWiFi() {
   // check for the WiFi module:
   if (WiFi.status() == WL_NO_MODULE) {
@@ -370,24 +398,22 @@ void connectWiFi() {
 
 void setup() {
   Serial.begin(9600);
-  delay(2000);  // Give serial time to stabilize
+  delay(2000); // Give serial time to stabilize
   
   connectWiFi();
 }
 
 void loop() {
-  // ========== FETCH ALL DATA (first boot + every 6 hours) ==========
-  // Unlike the old approach (4 separate calls), this single call gets: geo, time, weather, tithi
-  bool needsDataRefresh = (timeFetchedAtMs == 0) || (secondsElapsedSince(timeFetchedAtMs) >= SIX_HOURS_MS / 1000);
+  bool needsDataRefresh = (dataFetchedAtMs == 0) || (secondsElapsedSince(dataFetchedAtMs) >= SIX_HOURS_MS / 1000);
   
   if (needsDataRefresh) {
-    if (!fetchAggregatedDataFromServer(cachedTimeData, cachedGeo, cachedSun, cachedTithi)) {
+    String cachedPublicIp;
+    if (!fetchAggregatedDataFromServer(cachedPublicIp, cachedTimeData, cachedGeo, cachedSun, cachedTithi)) {
       delay(30000);
       return;
     }
 
-    timeFetchedAtMs = millis();
-    tithiFetchedAtMs = millis();
+    dataFetchedAtMs = millis();
     
     // Calculate when this tithi expires
     tithiExpiresAtMs = millis() + parseCompleteTimeToFutureMs(cachedTithi.completesAt);
@@ -397,14 +423,12 @@ void loop() {
     // Update local time based on elapsed milliseconds since fetch
     updateLocalTimeFromCache();
   }
-
-  // ========== SMART SLEEP ==========
   // Calculate next wake-up time based on nearest refresh deadline
   unsigned long nextWakeUpMs = ULONG_MAX;
   
   // Data refresh in 6 hours
-  if (timeFetchedAtMs > 0) {
-    unsigned long nextDataRefresh = timeFetchedAtMs + SIX_HOURS_MS;
+  if (dataFetchedAtMs > 0) {
+    unsigned long nextDataRefresh = dataFetchedAtMs + SIX_HOURS_MS;
     if (nextDataRefresh < nextWakeUpMs) nextWakeUpMs = nextDataRefresh;
   }
   
