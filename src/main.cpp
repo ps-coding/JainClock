@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <WiFiSSLClient.h>
 #include <ArduinoJson.h>
+#include "display/UI.h"
+#include "Models.h"
 
 char ssid[] = "NB_Guest";
 char password[] = "";
@@ -44,39 +46,6 @@ int extractHttpStatus(const String& response) {
   return atoi(statusStr.c_str());
 }
 
-struct GeoData {
-  String zip;
-  String city;
-  String country;
-  float timezoneOffset;
-  float lat;
-  float lon;
-};
-
-struct TimeData {
-  String iso;
-  String localTime;
-  int year;
-  int month;
-  int day;
-  int hour;
-  int minute;
-  int second;
-};
-
-struct SunData {
-  String sunrise;
-  String sunset;
-};
-
-struct JainTithiData {
-  int number;
-  String name;
-  String paksha;
-  String completesAt;
-  float leftPercentage;
-};
-
 void printFetchedData(const String& ip, const GeoData& geo, const TimeData& timeData, const SunData& sun, const JainTithiData& tithi) {
   Serial.println("----- Fetched Data -----");
   Serial.println("ip: " + ip);
@@ -113,12 +82,15 @@ const unsigned long ONE_MINUTE_MS = 60 * 1000UL;
 // Cached data (persists across loop iterations)
 GeoData cachedGeo;
 TimeData cachedTimeData;
+TimeData baseTimeData;
 SunData cachedSun;
 JainTithiData cachedTithi;
 
 // Timestamps (millis() when each data was fetched)
 unsigned long dataFetchedAtMs = 0;
 unsigned long tithiExpiresAtMs = 0;
+int lastDisplayedMinute = -1;
+int lastDisplayedSecond = -1;
 
 // Helper: Calculate seconds elapsed since a timestamp
 unsigned long secondsElapsedSince(unsigned long timestampMs) {
@@ -171,9 +143,9 @@ void updateLocalTimeFromCache() {
   }
 
   unsigned long long baseSeconds =
-    (unsigned long long)(cachedTimeData.hour * 3600) +
-    (unsigned long long)(cachedTimeData.minute * 60) +
-    (unsigned long long)cachedTimeData.second;
+    (unsigned long long)(baseTimeData.hour * 3600) +
+    (unsigned long long)(baseTimeData.minute * 60) +
+    (unsigned long long)baseTimeData.second;
 
   unsigned long long totalSeconds = baseSeconds + (unsigned long long)secondsElapsed;
   unsigned long long daysToAdvance = totalSeconds / 86400ULL;
@@ -183,9 +155,9 @@ void updateLocalTimeFromCache() {
   cachedTimeData.minute = (int)((secondsOfDay % 3600UL) / 60UL);
   cachedTimeData.second = (int)(secondsOfDay % 60UL);
 
-  int year = cachedTimeData.year;
-  int month = cachedTimeData.month;
-  int day = cachedTimeData.day;
+  int year = baseTimeData.year;
+  int month = baseTimeData.month;
+  int day = baseTimeData.day;
 
   if (year < 1) year = 1970;
   if (month < 1) month = 1;
@@ -215,6 +187,16 @@ void updateLocalTimeFromCache() {
   cachedTimeData.year = year;
   cachedTimeData.month = month;
   cachedTimeData.day = day;
+
+  char buff[9];
+  snprintf(buff, sizeof(buff), "%02d:%02d:%02d", cachedTimeData.hour, cachedTimeData.minute, cachedTimeData.second);
+  cachedTimeData.localTime = String(buff);
+
+  char isoBuff[20];
+  snprintf(isoBuff, sizeof(isoBuff), "%04d-%02d-%02d %02d:%02d:%02d",
+           cachedTimeData.year, cachedTimeData.month, cachedTimeData.day,
+           cachedTimeData.hour, cachedTimeData.minute, cachedTimeData.second);
+  cachedTimeData.iso = String(isoBuff);
 }
 
 // Helper: Parse datetime string "YYYY-MM-DD HH:MM:SS" to milliseconds from now
@@ -400,7 +382,10 @@ void setup() {
   Serial.begin(9600);
   delay(2000); // Give serial time to stabilize
   
-  connectWiFi();
+  UI.begin();            // Initialize UI with empty labels
+  UI.showLoadingState(); // Show loading screen
+  
+  connectWiFi();         // This blocks until WiFi is connected
 }
 
 void loop() {
@@ -414,6 +399,9 @@ void loop() {
     }
 
     dataFetchedAtMs = millis();
+    baseTimeData = cachedTimeData;
+    // Force next display update immediately after new data
+    lastDisplayedSecond = -1;
     
     // Calculate when this tithi expires
     tithiExpiresAtMs = millis() + parseCompleteTimeToFutureMs(cachedTithi.completesAt);
@@ -438,13 +426,28 @@ void loop() {
     if (nextTithiRefresh < nextWakeUpMs) nextWakeUpMs = nextTithiRefresh;
   }
   
-  unsigned long sleepMs = 300000;  // Default: 5 minutes (for display updates, etc.)
+  unsigned long sleepMs = 60000;  // Default: 1 minute to support minute-mark refreshes
   if (nextWakeUpMs != ULONG_MAX) {
     long secondsUntilRefresh = (long)(nextWakeUpMs - millis()) / 1000;
     if (secondsUntilRefresh > 0) {
-      sleepMs = min((unsigned long)secondsUntilRefresh * 1000, 300000UL);  // Cap at 5 min
+      sleepMs = min((unsigned long)secondsUntilRefresh * 1000, 60000UL);  // Cap at 1 min
     }
   }
-  
-  delay(sleepMs);
+
+  // Sleep in 1s slices so we can run LVGL timers and refresh display at minute boundaries
+  unsigned long waited = 0;
+  while (waited < sleepMs) {
+    lv_timer_handler();
+    delay(1000);
+    waited += 1000;
+
+    // Update local clock while idle
+    updateLocalTimeFromCache();
+
+    // Refresh display on second change (showing seconds)
+    if (cachedTimeData.second != lastDisplayedSecond) {
+      UI.showData(String(""), &cachedTimeData, &cachedGeo, &cachedSun, &cachedTithi);
+      lastDisplayedSecond = cachedTimeData.second;
+    }
+  }
 }
